@@ -1,0 +1,13 @@
+services:
+  - type: worker
+    name: telegram-signal-bot
+    env: python
+    buildCommand: pip install -r requirements_render_bot.txt
+    startCommand: python telegram_render_bot.py
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: EXCHANGE_ID
+        value: binance
+      - key: SYMBOLS
+        value: BTC/USDT,ETH/USDT,SOL/USDT,LTC/USDT
