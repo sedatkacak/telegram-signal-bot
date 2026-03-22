@@ -1,14 +1,22 @@
-import os
+import io
 import math
+import os
 import logging
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 import ccxt
 import pandas as pd
 import yfinance as yf
+import matplotlib.pyplot as plt
+
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
-from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+)
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -32,6 +40,17 @@ TIMEFRAMES = {
     "4h": {"label": "4 Saatlik", "limit": 260},
     "1d": {"label": "1 Günlük", "limit": 260},
 }
+
+# Pozisyon hesabı için varsayılanlar
+DEFAULT_ACCOUNT_SIZE = float(os.getenv("ACCOUNT_SIZE", "1000"))  # USDT
+DEFAULT_RISK_PERCENT = float(os.getenv("RISK_PERCENT", "1"))     # %
+
+# Bildirim aralığı
+NOTIFY_INTERVAL_MINUTES = int(os.getenv("NOTIFY_INTERVAL_MINUTES", "15"))
+
+# Basit hafıza
+USER_CHAT_IDS = set()
+LAST_ALERTS: Dict[str, str] = {}
 
 
 def build_exchange():
@@ -265,42 +284,33 @@ def fetch_usdtry_series(interval: str, period: str) -> pd.DataFrame:
 
 
 def fetch_metal_try_ohlcv(symbol: str, timeframe: str, limit: int):
-    # Yaklaşık dönüşüm:
-    # XAU/USD ve XAG/USD ons fiyatı -> gram fiyatı için 31.1035'e bölünüyor
-    # sonra USDTRY ile çarpılıyor
     if symbol == "XAU/TRY":
-        ticker = "GC=F"
+        ticker = "XAUUSD=X"
         display_symbol = "ALTIN/TL"
     else:
-        ticker = "SI=F"
+        ticker = "XAGUSD=X"
         display_symbol = "GÜMÜŞ/TL"
 
     if timeframe == "4h":
         metal = get_yf_df(ticker, interval="1h", period="60d")
         usdtry = fetch_usdtry_series(interval="1h", period="60d")
 
-        metal = metal.copy()
-        usdtry = usdtry.copy()
-
         metal.index = pd.to_datetime(metal.index).tz_localize(None)
         usdtry.index = pd.to_datetime(usdtry.index).tz_localize(None)
 
-        joined = metal.join(usdtry[["Close"]].rename(columns={"Close": "USDTRY"}), how="inner")
-        joined = joined.dropna()
+        joined = metal.join(usdtry[["Close"]].rename(columns={"Close": "USDTRY"}), how="inner").dropna()
 
         for col in ["Open", "High", "Low", "Close"]:
-            joined[col] = (joined[col] / 31.1035) * joined["USDTRY"]
+            joined[col] = joined[col] * joined["USDTRY"]
         joined["Volume"] = joined["Volume"].fillna(0)
 
-        resampled = joined.resample("4h").agg({
+        df = joined.resample("4h").agg({
             "Open": "first",
             "High": "max",
             "Low": "min",
             "Close": "last",
             "Volume": "sum",
-        }).dropna()
-
-        df = resampled.tail(limit)
+        }).dropna().tail(limit)
 
     elif timeframe == "1d":
         metal = get_yf_df(ticker, interval="1d", period="2y")
@@ -309,11 +319,10 @@ def fetch_metal_try_ohlcv(symbol: str, timeframe: str, limit: int):
         metal.index = pd.to_datetime(metal.index).tz_localize(None)
         usdtry.index = pd.to_datetime(usdtry.index).tz_localize(None)
 
-        joined = metal.join(usdtry[["Close"]].rename(columns={"Close": "USDTRY"}), how="inner")
-        joined = joined.dropna()
+        joined = metal.join(usdtry[["Close"]].rename(columns={"Close": "USDTRY"}), how="inner").dropna()
 
         for col in ["Open", "High", "Low", "Close"]:
-            joined[col] = (joined[col] / 31.1035) * joined["USDTRY"]
+            joined[col] = joined[col] * joined["USDTRY"]
         joined["Volume"] = joined["Volume"].fillna(0)
 
         df = joined.tail(limit)
@@ -326,16 +335,25 @@ def fetch_metal_try_ohlcv(symbol: str, timeframe: str, limit: int):
     ohlcv = []
     for idx, row in df.iterrows():
         ts = int(pd.Timestamp(idx).timestamp() * 1000)
-        ohlcv.append([ts, float(row["Open"]), float(row["High"]), float(row["Low"]), float(row["Close"]), float(row["Volume"])])
+        ohlcv.append([
+            ts,
+            float(row["Open"]),
+            float(row["High"]),
+            float(row["Low"]),
+            float(row["Close"]),
+            float(row["Volume"]),
+        ])
     return ohlcv, display_symbol
 
 
-def analyze_symbol(symbol: str, timeframe: str, limit: int) -> Dict:
-    display_symbol = symbol
+def get_ohlcv_and_symbol(symbol: str, timeframe: str, limit: int):
     if symbol in ("XAU/TRY", "XAG/TRY"):
-        candles, display_symbol = fetch_metal_try_ohlcv(symbol, timeframe, limit)
-    else:
-        candles = fetch_crypto_ohlcv(symbol, timeframe, limit)
+        return fetch_metal_try_ohlcv(symbol, timeframe, limit)
+    return fetch_crypto_ohlcv(symbol, timeframe, limit), symbol
+
+
+def analyze_symbol(symbol: str, timeframe: str, limit: int) -> Dict:
+    candles, display_symbol = get_ohlcv_and_symbol(symbol, timeframe, limit)
 
     if len(candles) < 220:
         raise ValueError(f"{display_symbol} için yeterli veri yok")
@@ -402,6 +420,7 @@ def analyze_symbol(symbol: str, timeframe: str, limit: int) -> Dict:
         stop, tp1, tp2 = long_stop, long_tp1, long_tp2
         rr = long_rr
         note = " | ".join(scored["long_notes"]) if scored["long_notes"] else "Long taraf daha güçlü."
+        direction = "long"
     elif scored["short_score"] > scored["long_score"] and short_signal != "BEKLE":
         signal = short_signal
         score = min(int(round(scored["short_score"])), 5)
@@ -409,9 +428,11 @@ def analyze_symbol(symbol: str, timeframe: str, limit: int) -> Dict:
         stop, tp1, tp2 = short_stop, short_tp1, short_tp2
         rr = short_rr
         note = " | ".join(scored["short_notes"]) if scored["short_notes"] else "Short taraf daha güçlü."
+        direction = "short"
     else:
         signal = "BEKLE"
         score = max(min(int(round(max(scored["long_score"], scored["short_score"]))), 5), 1)
+        direction = "none"
         if scored["bullish_trend"]:
             entry_low, entry_high = long_entry_low, long_entry_high
             stop, tp1, tp2 = long_stop, long_tp1, long_tp2
@@ -431,6 +452,17 @@ def analyze_symbol(symbol: str, timeframe: str, limit: int) -> Dict:
     trade_type = classify_trade_type(timeframe, rr, score)
     entry_quality = classify_entry_quality(price, entry_low, entry_high)
 
+    # Geç giriş filtresi
+    if signal in ("GÜÇLÜ AL", "AL", "GÜÇLÜ SAT", "SAT") and entry_quality == "Geç":
+        signal = "BEKLE"
+        note = f"{note} | Giriş geç kaldı, yeni işlem için ideal değil."
+        direction = "none"
+
+    if rr < 1.4 and signal != "BEKLE":
+        signal = "BEKLE"
+        note = f"{note} | Risk/Ödül zayıf, işlem iptal."
+        direction = "none"
+
     return {
         "symbol": display_symbol,
         "price": price,
@@ -445,7 +477,19 @@ def analyze_symbol(symbol: str, timeframe: str, limit: int) -> Dict:
         "note": note,
         "trade_type": trade_type,
         "entry_quality": entry_quality,
+        "direction": direction,
+        "closes": closes,
     }
+
+
+def calculate_position_size(account_size: float, risk_percent: float, entry_low: float, entry_high: float, stop: float) -> Tuple[float, float]:
+    entry = (entry_low + entry_high) / 2
+    risk_amount = account_size * (risk_percent / 100.0)
+    stop_distance = abs(entry - stop)
+    if stop_distance <= 0:
+        return 0.0, risk_amount
+    position_size = risk_amount / stop_distance * entry
+    return round(position_size, 2), round(risk_amount, 2)
 
 
 def build_menu() -> InlineKeyboardMarkup:
@@ -456,11 +500,13 @@ def build_menu() -> InlineKeyboardMarkup:
 def build_detail_buttons(symbol: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🔄 Güncelle", callback_data=f"refresh:{symbol}")],
+        [InlineKeyboardButton("📊 Grafik", callback_data=f"chart:{symbol}")],
+        [InlineKeyboardButton("💰 Pozisyon", callback_data=f"size:{symbol}")],
         [InlineKeyboardButton("↩️ Listeye Dön", callback_data="back:list")],
     ])
 
 
-def build_message(symbol: str, data_4h: Dict, data_1d: Dict) -> str:
+def build_message(data_4h: Dict, data_1d: Dict) -> str:
     if data_4h["signal"] in ("GÜÇLÜ AL", "AL") and data_1d["signal"] in ("GÜÇLÜ AL", "AL"):
         general = "Yön yukarı tarafı destekliyor. Kademeli giriş düşünülebilir."
     elif data_4h["signal"] in ("GÜÇLÜ SAT", "SAT") and data_1d["signal"] in ("GÜÇLÜ SAT", "SAT"):
@@ -504,8 +550,78 @@ Not: {data_1d["note"]}
 """
 
 
+def create_chart(symbol: str, timeframe: str = "4h", limit: int = 120) -> io.BytesIO:
+    candles, display_symbol = get_ohlcv_and_symbol(symbol, timeframe, limit)
+    closes = [c[4] for c in candles]
+    ema50_values = ema(closes, 50)
+    ema200_values = ema(closes, 200)
+
+    fig = plt.figure(figsize=(10, 5))
+    ax = fig.add_subplot(111)
+    ax.plot(closes, label="Fiyat")
+    ax.plot(ema50_values, label="EMA50")
+    ax.plot(ema200_values, label="EMA200")
+    ax.set_title(f"{display_symbol} - {timeframe}")
+    ax.set_xlabel("Mum")
+    ax.set_ylabel("Fiyat")
+    ax.legend()
+    ax.grid(True)
+
+    buffer = io.BytesIO()
+    plt.tight_layout()
+    plt.savefig(buffer, format="png")
+    plt.close(fig)
+    buffer.seek(0)
+    return buffer
+
+
+def alert_text(symbol: str, data_4h: Dict, data_1d: Dict) -> str:
+    return f"""
+🚨 *{data_4h["symbol"]}* {data_4h["signal"]}
+Fiyat: `{fmt_price(data_4h["price"])}`
+4H işlem bölgesi: `{fmt_price(data_4h["entry_low"])}` - `{fmt_price(data_4h["entry_high"])}`
+Stop: `{fmt_price(data_4h["stop"])}`
+Hedef 1: `{fmt_price(data_4h["tp1"])}`
+Hedef 2: `{fmt_price(data_4h["tp2"])}`
+Risk/Ödül: `{data_4h["rr"]}`
+
+Günlük: *{data_1d["signal"]}*
+Not: {data_4h["note"]}
+"""
+
+
+async def notify_strong_signals(context: ContextTypes.DEFAULT_TYPE):
+    if not USER_CHAT_IDS:
+        return
+
+    for symbol in SYMBOLS:
+        try:
+            data_4h = analyze_symbol(symbol, "4h", TIMEFRAMES["4h"]["limit"])
+            data_1d = analyze_symbol(symbol, "1d", TIMEFRAMES["1d"]["limit"])
+
+            if data_4h["signal"] not in ("GÜÇLÜ AL", "GÜÇLÜ SAT"):
+                continue
+
+            key = f"{symbol}:{data_4h['signal']}:{round(data_4h['price'], 4)}"
+            if LAST_ALERTS.get(symbol) == key:
+                continue
+
+            LAST_ALERTS[symbol] = key
+            text = alert_text(symbol, data_4h, data_1d)
+
+            for chat_id in USER_CHAT_IDS:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=text,
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+        except Exception:
+            logger.exception("Bildirim taramasında hata: %s", symbol)
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message:
+        USER_CHAT_IDS.add(update.message.chat_id)
         await update.message.reply_text("Varlık seç:", reply_markup=build_menu())
 
 
@@ -521,28 +637,53 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("Varlık seç:", reply_markup=build_menu())
         return
 
-    if data.startswith("symbol:"):
-        symbol = data.split(":", 1)[1]
-    elif data.startswith("refresh:"):
-        symbol = data.split(":", 1)[1]
-    else:
-        return
-
     try:
-        data_4h = analyze_symbol(symbol, "4h", TIMEFRAMES["4h"]["limit"])
-        data_1d = analyze_symbol(symbol, "1d", TIMEFRAMES["1d"]["limit"])
-        text = build_message(symbol, data_4h, data_1d)
+        if data.startswith("symbol:") or data.startswith("refresh:"):
+            symbol = data.split(":", 1)[1]
+            data_4h = analyze_symbol(symbol, "4h", TIMEFRAMES["4h"]["limit"])
+            data_1d = analyze_symbol(symbol, "1d", TIMEFRAMES["1d"]["limit"])
+            text = build_message(data_4h, data_1d)
 
-        await query.edit_message_text(
-            text=text,
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=build_detail_buttons(symbol),
-        )
+            await query.edit_message_text(
+                text=text,
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=build_detail_buttons(symbol),
+            )
+            return
+
+        if data.startswith("chart:"):
+            symbol = data.split(":", 1)[1]
+            chart = create_chart(symbol, "4h", 120)
+            await query.message.reply_photo(photo=chart, caption=f"{symbol} 4 Saatlik Grafik")
+            return
+
+        if data.startswith("size:"):
+            symbol = data.split(":", 1)[1]
+            data_4h = analyze_symbol(symbol, "4h", TIMEFRAMES["4h"]["limit"])
+            position_size, risk_amount = calculate_position_size(
+                DEFAULT_ACCOUNT_SIZE,
+                DEFAULT_RISK_PERCENT,
+                data_4h["entry_low"],
+                data_4h["entry_high"],
+                data_4h["stop"],
+            )
+            text = f"""
+*{data_4h["symbol"]} Pozisyon Hesabı*
+Bakiye: `{DEFAULT_ACCOUNT_SIZE} USDT`
+Risk: `%{DEFAULT_RISK_PERCENT}`
+Riske edilen tutar: `{risk_amount} USDT`
+Önerilen pozisyon büyüklüğü: `{position_size} USDT`
+
+Giriş bölgesi: `{fmt_price(data_4h["entry_low"])}` - `{fmt_price(data_4h["entry_high"])}`
+Stop: `{fmt_price(data_4h["stop"])}`
+"""
+            await query.message.reply_text(text=text, parse_mode=ParseMode.MARKDOWN)
+            return
+
     except Exception as e:
         logger.exception("Callback işleminde hata")
-        await query.edit_message_text(
-            text=f"Bir hata oluştu: {e}\n\nTekrar /start yazıp yeniden deneyebilirsin.",
-            reply_markup=build_menu(),
+        await query.message.reply_text(
+            text=f"Bir hata oluştu: {e}\n\nTekrar /start yazıp yeniden deneyebilirsin."
         )
 
 
@@ -552,8 +693,20 @@ def main():
 
     logger.info("Bot başlatılıyor...")
     application = Application.builder().token(BOT_TOKEN).build()
+
+    # webhook temizle
+    application.bot_data["startup"] = True
+
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CallbackQueryHandler(handle_callback))
+
+    if application.job_queue:
+        application.job_queue.run_repeating(
+            notify_strong_signals,
+            interval=NOTIFY_INTERVAL_MINUTES * 60,
+            first=60,
+        )
+
     application.run_polling(drop_pending_updates=True)
 
 
