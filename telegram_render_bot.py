@@ -15,7 +15,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '')
-EXCHANGE_ID = os.getenv('EXCHANGE_ID', 'bybit')
+EXCHANGE_ID = os.getenv('EXCHANGE_ID', 'kucoin')
 SYMBOLS = [s.strip() for s in os.getenv('SYMBOLS', 'BTC/USDT,ETH/USDT,SOL/USDT,LTC/USDT').split(',') if s.strip()]
 
 TIMEFRAMES = {
