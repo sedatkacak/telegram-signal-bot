@@ -1,4 +1,5 @@
-python-telegram-bot==21.7
+python-telegram-bot[job-queue]==21.7
 ccxt
 pandas
 yfinance
+matplotlib
