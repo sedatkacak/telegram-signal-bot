@@ -6,12 +6,7 @@ from typing import Dict, List, Tuple
 import ccxt
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
-from telegram.ext import (
-    Application,
-    CallbackQueryHandler,
-    CommandHandler,
-    ContextTypes,
-)
+from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -73,7 +68,6 @@ def rsi(values: List[float], period: int = 14) -> List[float]:
 
     avg_gain = sum(gains[1:period + 1]) / period
     avg_loss = sum(losses[1:period + 1]) / period
-
     rsis = [50.0] * len(values)
 
     if avg_loss == 0:
@@ -115,12 +109,132 @@ def fmt_price(x: float) -> str:
     return f"{x:,.6f}"
 
 
+def classify_trade_type(timeframe: str, rr: float, score: int) -> str:
+    if timeframe == "4h":
+        if score >= 4 and rr >= 2.0:
+            return "Swing"
+        return "Scalp / Kısa vade"
+    return "Swing / Orta vade"
+
+
+def classify_entry_quality(price: float, entry_low: float, entry_high: float) -> str:
+    center = (entry_low + entry_high) / 2
+    band = max((entry_high - entry_low) / 2, 1e-9)
+    distance = abs(price - center) / band
+
+    if distance <= 0.4:
+        return "İyi"
+    if distance <= 1.0:
+        return "Orta"
+    return "Geç"
+
+
+def score_market(
+    price: float,
+    ema50: float,
+    ema200: float,
+    rsi14: float,
+    macd_now: float,
+    macd_sig_now: float,
+    volume_now: float,
+    volume_avg: float,
+    recent_high: float,
+    recent_low: float,
+    rr_long: float,
+    rr_short: float,
+) -> Dict:
+    bullish_trend = price > ema50 and ema50 > ema200
+    bearish_trend = price < ema50 and ema50 < ema200
+
+    above_ema50 = price > ema50
+    below_ema50 = price < ema50
+
+    bullish_momentum = rsi14 >= 54 and macd_now > macd_sig_now
+    bearish_momentum = rsi14 <= 46 and macd_now < macd_sig_now
+
+    strong_volume = volume_avg > 0 and volume_now > volume_avg * 1.05
+
+    breakout_up = price >= recent_high * 0.995
+    breakdown_down = price <= recent_low * 1.005
+
+    long_score = 0
+    short_score = 0
+    long_notes = []
+    short_notes = []
+
+    if bullish_trend:
+        long_score += 2
+        long_notes.append("Trend yukarı")
+    elif above_ema50:
+        long_score += 1
+        long_notes.append("Fiyat EMA50 üstü")
+
+    if bearish_trend:
+        short_score += 2
+        short_notes.append("Trend aşağı")
+    elif below_ema50:
+        short_score += 1
+        short_notes.append("Fiyat EMA50 altı")
+
+    if bullish_momentum:
+        long_score += 1
+        long_notes.append("Momentum pozitif")
+    if bearish_momentum:
+        short_score += 1
+        short_notes.append("Momentum negatif")
+
+    if strong_volume:
+        if bullish_trend or above_ema50:
+            long_score += 1
+            long_notes.append("Hacim destekli")
+        if bearish_trend or below_ema50:
+            short_score += 1
+            short_notes.append("Hacim destekli")
+
+    if breakout_up:
+        long_score += 1
+        long_notes.append("Yukarı kırılım yakın")
+    if breakdown_down:
+        short_score += 1
+        short_notes.append("Aşağı kırılım yakın")
+
+    if rr_long >= 2.0:
+        long_score += 1
+        long_notes.append(f"RR iyi ({rr_long})")
+    elif rr_long >= 1.4:
+        long_score += 0.5
+        long_notes.append(f"RR kabul edilebilir ({rr_long})")
+
+    if rr_short >= 2.0:
+        short_score += 1
+        short_notes.append(f"RR iyi ({rr_short})")
+    elif rr_short >= 1.4:
+        short_score += 0.5
+        short_notes.append(f"RR kabul edilebilir ({rr_short})")
+
+    return {
+        "long_score": long_score,
+        "short_score": short_score,
+        "long_notes": long_notes,
+        "short_notes": short_notes,
+        "bullish_trend": bullish_trend,
+        "bearish_trend": bearish_trend,
+    }
+
+
+def signal_from_score(score: float, direction: str) -> str:
+    if score >= 4.5:
+        return "GÜÇLÜ AL" if direction == "long" else "GÜÇLÜ SAT"
+    if score >= 3.0:
+        return "AL" if direction == "long" else "SAT"
+    return "BEKLE"
+
+
 def analyze_symbol(symbol: str, timeframe: str, limit: int) -> Dict:
     candles = fetch_ohlcv(symbol, timeframe, limit)
     if len(candles) < 220:
         raise ValueError(f"{symbol} için yeterli veri yok")
 
-    opens = [c[1] for c in candles]
     highs = [c[2] for c in candles]
     lows = [c[3] for c in candles]
     closes = [c[4] for c in candles]
@@ -138,120 +252,88 @@ def analyze_symbol(symbol: str, timeframe: str, limit: int) -> Dict:
     recent_high = max(highs[-20:])
     recent_low = min(lows[-20:])
 
-    bullish_trend = price > ema50 and ema50 > ema200
-    bearish_trend = price < ema50 and ema50 < ema200
-    bullish_momentum = rsi14 >= 55 and macd_now > macd_sig_now
-    bearish_momentum = rsi14 <= 45 and macd_now < macd_sig_now
-    strong_volume = not math.isnan(vol_sma20) and vol_sma20 > 0 and volumes[-1] > vol_sma20
-    breakout_up = price >= recent_high * 0.995
-    breakdown_down = price <= recent_low * 1.005
-
+    # Long setup
     long_entry_low = ema50 * 0.995
     long_entry_high = ema50 * 1.005
     long_stop = min(recent_low, ema50 * 0.985)
     long_tp1 = price * 1.02
     long_tp2 = price * 1.04
+    long_entry = (long_entry_low + long_entry_high) / 2
+    long_risk = max(long_entry - long_stop, 0.0)
+    long_reward = max(long_tp1 - long_entry, 0.0)
+    long_rr = round(long_reward / long_risk, 2) if long_risk > 0 else 0.0
 
+    # Short setup
     short_entry_low = ema50 * 0.995
     short_entry_high = ema50 * 1.005
     short_stop = max(recent_high, ema50 * 1.015)
     short_tp1 = price * 0.98
     short_tp2 = price * 0.96
-
-    long_entry = (long_entry_low + long_entry_high) / 2
     short_entry = (short_entry_low + short_entry_high) / 2
-
-    long_risk = max(long_entry - long_stop, 0.0)
-    long_reward = max(long_tp1 - long_entry, 0.0)
-    long_rr = round(long_reward / long_risk, 2) if long_risk > 0 else 0.0
-
     short_risk = max(short_stop - short_entry, 0.0)
     short_reward = max(short_entry - short_tp1, 0.0)
     short_rr = round(short_reward / short_risk, 2) if short_risk > 0 else 0.0
 
-    long_score = 0
-    short_score = 0
-    notes = []
+    scored = score_market(
+        price=price,
+        ema50=ema50,
+        ema200=ema200,
+        rsi14=rsi14,
+        macd_now=macd_now,
+        macd_sig_now=macd_sig_now,
+        volume_now=volumes[-1],
+        volume_avg=vol_sma20 if not math.isnan(vol_sma20) else 0.0,
+        recent_high=recent_high,
+        recent_low=recent_low,
+        rr_long=long_rr,
+        rr_short=short_rr,
+    )
 
-    if bullish_trend:
-        long_score += 1
-        notes.append("Trend yukarı")
-    elif bearish_trend:
-        short_score += 1
-        notes.append("Trend aşağı")
-    else:
-        notes.append("Trend karışık")
+    long_signal = signal_from_score(scored["long_score"], "long")
+    short_signal = signal_from_score(scored["short_score"], "short")
 
-    if bullish_momentum:
-        long_score += 1
-        notes.append("Momentum alıcı")
-    elif bearish_momentum:
-        short_score += 1
-        notes.append("Momentum satıcı")
-    else:
-        notes.append("Momentum zayıf")
-
-    if strong_volume:
-        if bullish_trend:
-            long_score += 1
-        elif bearish_trend:
-            short_score += 1
-        notes.append("Hacim güçlü")
-    else:
-        notes.append("Hacim zayıf")
-
-    if breakout_up and bullish_trend:
-        long_score += 1
-        notes.append("Yukarı kırılım yakın")
-    if breakdown_down and bearish_trend:
-        short_score += 1
-        notes.append("Aşağı kırılım yakın")
-
-    if long_rr >= 2.0:
-        long_score += 1
-    if short_rr >= 2.0:
-        short_score += 1
-
-    if long_score >= 4 and bullish_trend and bullish_momentum and long_rr >= 2.0:
-        signal = "GÜÇLÜ AL"
+    # Hangisi daha kuvvetli?
+    if scored["long_score"] > scored["short_score"] and long_signal != "BEKLE":
+        signal = long_signal
+        score = min(int(round(scored["long_score"])), 5)
         entry_low, entry_high = long_entry_low, long_entry_high
         stop, tp1, tp2 = long_stop, long_tp1, long_tp2
         rr = long_rr
-        score = long_score
-        note = " | ".join(notes)
-    elif short_score >= 4 and bearish_trend and bearish_momentum and short_rr >= 2.0:
-        signal = "GÜÇLÜ SAT"
+        note = " | ".join(scored["long_notes"]) if scored["long_notes"] else "Long taraf daha güçlü."
+    elif scored["short_score"] > scored["long_score"] and short_signal != "BEKLE":
+        signal = short_signal
+        score = min(int(round(scored["short_score"])), 5)
         entry_low, entry_high = short_entry_low, short_entry_high
         stop, tp1, tp2 = short_stop, short_tp1, short_tp2
         rr = short_rr
-        score = short_score
-        note = " | ".join(notes)
+        note = " | ".join(scored["short_notes"]) if scored["short_notes"] else "Short taraf daha güçlü."
     else:
         signal = "BEKLE"
-        if bullish_trend:
+        score = max(min(int(round(max(scored["long_score"], scored["short_score"]))), 5), 1)
+        if scored["bullish_trend"]:
             entry_low, entry_high = long_entry_low, long_entry_high
             stop, tp1, tp2 = long_stop, long_tp1, long_tp2
             rr = long_rr
-            score = long_score
-            note = "Kurulum var ama yeterince güçlü değil."
-        elif bearish_trend:
+            note = "Long taraf var ama yeterince güçlü değil."
+        elif scored["bearish_trend"]:
             entry_low, entry_high = short_entry_low, short_entry_high
             stop, tp1, tp2 = short_stop, short_tp1, short_tp2
             rr = short_rr
-            score = short_score
-            note = "Kurulum var ama yeterince güçlü değil."
+            note = "Short taraf var ama yeterince güçlü değil."
         else:
             entry_low, entry_high = price * 0.995, price * 1.005
             stop, tp1, tp2 = price * 0.98, price * 1.02, price * 1.04
             rr = 0.0
-            score = 1
             note = "Trend karışık, net işlem yok."
+
+    trade_type = classify_trade_type(timeframe, rr, score)
+    entry_quality = classify_entry_quality(price, entry_low, entry_high)
 
     return {
         "symbol": symbol,
         "price": price,
         "signal": signal,
-        "score": min(score, 5),
+        "score": score,
         "entry_low": entry_low,
         "entry_high": entry_high,
         "stop": stop,
@@ -259,9 +341,8 @@ def analyze_symbol(symbol: str, timeframe: str, limit: int) -> Dict:
         "tp2": tp2,
         "rr": rr,
         "note": note,
-        "ema50": ema50,
-        "ema200": ema200,
-        "rsi": rsi14,
+        "trade_type": trade_type,
+        "entry_quality": entry_quality,
     }
 
 
@@ -278,23 +359,26 @@ def build_detail_buttons(symbol: str) -> InlineKeyboardMarkup:
 
 
 def build_message(symbol: str, data_4h: Dict, data_1d: Dict) -> str:
-    direction_note = ""
-    if data_4h["signal"] == data_1d["signal"] and data_4h["signal"] in ("GÜÇLÜ AL", "GÜÇLÜ SAT"):
-        direction_note = "Çoklu zaman dilimi uyumlu."
-    elif data_4h["signal"] in ("GÜÇLÜ AL", "GÜÇLÜ SAT") and data_1d["signal"] == "BEKLE":
-        direction_note = "Kısa vadede sinyal var ama günlük teyit sınırlı."
-    elif data_4h["signal"] == "BEKLE" and data_1d["signal"] in ("GÜÇLÜ AL", "GÜÇLÜ SAT"):
-        direction_note = "Günlük yön var ama kısa vadeli giriş net değil."
+    if data_4h["signal"] in ("GÜÇLÜ AL", "AL") and data_1d["signal"] in ("GÜÇLÜ AL", "AL"):
+        general = "Yön yukarı tarafı destekliyor. Kademeli giriş düşünülebilir."
+    elif data_4h["signal"] in ("GÜÇLÜ SAT", "SAT") and data_1d["signal"] in ("GÜÇLÜ SAT", "SAT"):
+        general = "Yön aşağı tarafı destekliyor. Zayıflık sürerse satış baskısı devam edebilir."
+    elif data_4h["signal"] in ("GÜÇLÜ AL", "AL") and data_1d["signal"] == "BEKLE":
+        general = "Kısa vadeli long var ama günlük teyit zayıf."
+    elif data_4h["signal"] in ("GÜÇLÜ SAT", "SAT") and data_1d["signal"] == "BEKLE":
+        general = "Kısa vadeli short baskısı var ama günlük teyit zayıf."
     else:
-        direction_note = "Net kurulum yok."
+        general = "Net kurulum yok."
 
-    text = f"""
+    return f"""
 *{symbol}*
 Anlık fiyat: `{fmt_price(data_4h["price"])}`
 
 *4 Saatlik*
 Sinyal: *{data_4h["signal"]}*
 Güven skoru: *{data_4h["score"]}/5*
+İşlem tipi: *{data_4h["trade_type"]}*
+Giriş kalitesi: *{data_4h["entry_quality"]}*
 İşlem bölgesi: `{fmt_price(data_4h["entry_low"])}` - `{fmt_price(data_4h["entry_high"])}`
 Stop: `{fmt_price(data_4h["stop"])}`
 Hedef 1: `{fmt_price(data_4h["tp1"])}`
@@ -305,6 +389,8 @@ Not: {data_4h["note"]}
 *1 Günlük*
 Sinyal: *{data_1d["signal"]}*
 Güven skoru: *{data_1d["score"]}/5*
+İşlem tipi: *{data_1d["trade_type"]}*
+Giriş kalitesi: *{data_1d["entry_quality"]}*
 İşlem bölgesi: `{fmt_price(data_1d["entry_low"])}` - `{fmt_price(data_1d["entry_high"])}`
 Stop: `{fmt_price(data_1d["stop"])}`
 Hedef 1: `{fmt_price(data_1d["tp1"])}`
@@ -312,9 +398,8 @@ Hedef 2: `{fmt_price(data_1d["tp2"])}`
 Risk/Ödül: `{data_1d["rr"]}`
 Not: {data_1d["note"]}
 
-*Genel Yorum:* {direction_note}
+*Genel Yorum:* {general}
 """
-    return text
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
