@@ -4,6 +4,8 @@ import logging
 from typing import Dict, List, Tuple
 
 import ccxt
+import pandas as pd
+import yfinance as yf
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
@@ -16,7 +18,15 @@ logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 EXCHANGE_ID = os.getenv("EXCHANGE_ID", "kucoin")
-SYMBOLS = [s.strip() for s in os.getenv("SYMBOLS", "BTC/USDT,ETH/USDT,SOL/USDT,LTC/USDT").split(",")]
+
+SYMBOLS = [
+    "BTC/USDT",
+    "ETH/USDT",
+    "SOL/USDT",
+    "LTC/USDT",
+    "XAU/TRY",
+    "XAG/TRY",
+]
 
 TIMEFRAMES = {
     "4h": {"label": "4 Saatlik", "limit": 260},
@@ -97,10 +107,6 @@ def macd(values: List[float]) -> Tuple[List[float], List[float], List[float]]:
     return macd_line, signal_line, hist
 
 
-def fetch_ohlcv(symbol: str, timeframe: str, limit: int):
-    return exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-
-
 def fmt_price(x: float) -> str:
     if x >= 1000:
         return f"{x:,.2f}"
@@ -157,8 +163,8 @@ def score_market(
     breakout_up = price >= recent_high * 0.995
     breakdown_down = price <= recent_low * 1.005
 
-    long_score = 0
-    short_score = 0
+    long_score = 0.0
+    short_score = 0.0
     long_notes = []
     short_notes = []
 
@@ -230,10 +236,109 @@ def signal_from_score(score: float, direction: str) -> str:
     return "BEKLE"
 
 
+def fetch_crypto_ohlcv(symbol: str, timeframe: str, limit: int):
+    return exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+
+
+def get_yf_df(ticker: str, interval: str, period: str) -> pd.DataFrame:
+    df = yf.download(ticker, interval=interval, period=period, auto_adjust=False, progress=False)
+    if df is None or df.empty:
+        raise ValueError(f"{ticker} için veri alınamadı")
+
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = [c[0] for c in df.columns]
+
+    df = df.rename(columns=str.title)
+    needed = ["Open", "High", "Low", "Close", "Volume"]
+    for col in needed:
+        if col not in df.columns:
+            if col == "Volume":
+                df[col] = 0.0
+            else:
+                raise ValueError(f"{ticker} verisinde {col} yok")
+
+    return df[needed].dropna()
+
+
+def fetch_usdtry_series(interval: str, period: str) -> pd.DataFrame:
+    return get_yf_df("USDTRY=X", interval=interval, period=period)
+
+
+def fetch_metal_try_ohlcv(symbol: str, timeframe: str, limit: int):
+    # Yaklaşık dönüşüm:
+    # XAU/USD ve XAG/USD ons fiyatı -> gram fiyatı için 31.1035'e bölünüyor
+    # sonra USDTRY ile çarpılıyor
+    if symbol == "XAU/TRY":
+        ticker = "GC=F"
+        display_symbol = "ALTIN/TL"
+    else:
+        ticker = "SI=F"
+        display_symbol = "GÜMÜŞ/TL"
+
+    if timeframe == "4h":
+        metal = get_yf_df(ticker, interval="1h", period="60d")
+        usdtry = fetch_usdtry_series(interval="1h", period="60d")
+
+        metal = metal.copy()
+        usdtry = usdtry.copy()
+
+        metal.index = pd.to_datetime(metal.index).tz_localize(None)
+        usdtry.index = pd.to_datetime(usdtry.index).tz_localize(None)
+
+        joined = metal.join(usdtry[["Close"]].rename(columns={"Close": "USDTRY"}), how="inner")
+        joined = joined.dropna()
+
+        for col in ["Open", "High", "Low", "Close"]:
+            joined[col] = (joined[col] / 31.1035) * joined["USDTRY"]
+        joined["Volume"] = joined["Volume"].fillna(0)
+
+        resampled = joined.resample("4h").agg({
+            "Open": "first",
+            "High": "max",
+            "Low": "min",
+            "Close": "last",
+            "Volume": "sum",
+        }).dropna()
+
+        df = resampled.tail(limit)
+
+    elif timeframe == "1d":
+        metal = get_yf_df(ticker, interval="1d", period="2y")
+        usdtry = fetch_usdtry_series(interval="1d", period="2y")
+
+        metal.index = pd.to_datetime(metal.index).tz_localize(None)
+        usdtry.index = pd.to_datetime(usdtry.index).tz_localize(None)
+
+        joined = metal.join(usdtry[["Close"]].rename(columns={"Close": "USDTRY"}), how="inner")
+        joined = joined.dropna()
+
+        for col in ["Open", "High", "Low", "Close"]:
+            joined[col] = (joined[col] / 31.1035) * joined["USDTRY"]
+        joined["Volume"] = joined["Volume"].fillna(0)
+
+        df = joined.tail(limit)
+    else:
+        raise ValueError("Desteklenmeyen zaman dilimi")
+
+    if df.empty:
+        raise ValueError(f"{display_symbol} için veri boş geldi")
+
+    ohlcv = []
+    for idx, row in df.iterrows():
+        ts = int(pd.Timestamp(idx).timestamp() * 1000)
+        ohlcv.append([ts, float(row["Open"]), float(row["High"]), float(row["Low"]), float(row["Close"]), float(row["Volume"])])
+    return ohlcv, display_symbol
+
+
 def analyze_symbol(symbol: str, timeframe: str, limit: int) -> Dict:
-    candles = fetch_ohlcv(symbol, timeframe, limit)
+    display_symbol = symbol
+    if symbol in ("XAU/TRY", "XAG/TRY"):
+        candles, display_symbol = fetch_metal_try_ohlcv(symbol, timeframe, limit)
+    else:
+        candles = fetch_crypto_ohlcv(symbol, timeframe, limit)
+
     if len(candles) < 220:
-        raise ValueError(f"{symbol} için yeterli veri yok")
+        raise ValueError(f"{display_symbol} için yeterli veri yok")
 
     highs = [c[2] for c in candles]
     lows = [c[3] for c in candles]
@@ -252,7 +357,6 @@ def analyze_symbol(symbol: str, timeframe: str, limit: int) -> Dict:
     recent_high = max(highs[-20:])
     recent_low = min(lows[-20:])
 
-    # Long setup
     long_entry_low = ema50 * 0.995
     long_entry_high = ema50 * 1.005
     long_stop = min(recent_low, ema50 * 0.985)
@@ -263,7 +367,6 @@ def analyze_symbol(symbol: str, timeframe: str, limit: int) -> Dict:
     long_reward = max(long_tp1 - long_entry, 0.0)
     long_rr = round(long_reward / long_risk, 2) if long_risk > 0 else 0.0
 
-    # Short setup
     short_entry_low = ema50 * 0.995
     short_entry_high = ema50 * 1.005
     short_stop = max(recent_high, ema50 * 1.015)
@@ -292,7 +395,6 @@ def analyze_symbol(symbol: str, timeframe: str, limit: int) -> Dict:
     long_signal = signal_from_score(scored["long_score"], "long")
     short_signal = signal_from_score(scored["short_score"], "short")
 
-    # Hangisi daha kuvvetli?
     if scored["long_score"] > scored["short_score"] and long_signal != "BEKLE":
         signal = long_signal
         score = min(int(round(scored["long_score"])), 5)
@@ -330,7 +432,7 @@ def analyze_symbol(symbol: str, timeframe: str, limit: int) -> Dict:
     entry_quality = classify_entry_quality(price, entry_low, entry_high)
 
     return {
-        "symbol": symbol,
+        "symbol": display_symbol,
         "price": price,
         "signal": signal,
         "score": score,
@@ -371,7 +473,7 @@ def build_message(symbol: str, data_4h: Dict, data_1d: Dict) -> str:
         general = "Net kurulum yok."
 
     return f"""
-*{symbol}*
+*{data_4h["symbol"]}*
 Anlık fiyat: `{fmt_price(data_4h["price"])}`
 
 *4 Saatlik*
@@ -404,7 +506,7 @@ Not: {data_1d["note"]}
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message:
-        await update.message.reply_text("Coin seç:", reply_markup=build_menu())
+        await update.message.reply_text("Varlık seç:", reply_markup=build_menu())
 
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -416,7 +518,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data or ""
 
     if data == "back:list":
-        await query.edit_message_text("Coin seç:", reply_markup=build_menu())
+        await query.edit_message_text("Varlık seç:", reply_markup=build_menu())
         return
 
     if data.startswith("symbol:"):
